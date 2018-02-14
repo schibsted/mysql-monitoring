@@ -1,0 +1,232 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+mysql - Munin plugin to display MySQL connection details (breakdown by
+database and user).
+
+=head1 APPLICABLE SYSTEMS
+
+Should work on most MySQL platforms.
+
+=head1 CONFIGURATION
+
+Identical to mysql plugin.  Change section heading from [mysql] to
+[mysql*] and you're good.
+
+=head1 LICENSE
+
+Any version of GPL.
+
+Copyright (C) 2018 Nicolai Langfeldt, Schibsted Media.
+
+=head1 VERSION
+
+git
+
+=head1 MAGIC MARKERS
+
+  #%# family=auto
+
+=cut
+
+use v5.10;
+use strict;
+use warnings;
+
+use DBI;
+use Storable qw[freeze thaw];
+use Data::Dumper;
+use Munin::Plugin;
+
+need_multigraph();
+
+my %config =
+  (
+   'dsn'      => $ENV{'mysqlconnection'}   // 'DBI:mysql:mysql',
+   'user'     => $ENV{'mysqluser'}         // 'root',
+   'password' => $ENV{'mysqlpassword'}     // '',
+   'hostname' => $ENV{'hostname'}          // '',
+  );
+
+my $retention = 604800; # Seconds in a week
+
+my %defaults =
+  (
+   type  => 'GAUGE',
+   draw  => 'AREASTACK',
+  );
+
+
+my %munin_config =
+  (
+   'byUser' =>
+   {
+    _multigraph => 'mysql_connections_byuser',
+    graph_title => 'Connections by user ID',
+    graph_vlabel => 'Connections',
+    graph_category => 'mysql',
+    graph_total => 'Total',
+    graph_printf => '%5.1lf',
+    graph_info => 'This shows a snapshot of connections, there may be many more connections in use between these checks. Please refer to the "Connections" graph labeled "Max used"'
+   },
+   'byDb' =>
+   {
+    _multigraph => 'mysql_connections_bydb',
+    graph_title => 'Connections by Database',
+    graph_vlabel => 'Connections',
+    graph_category => 'mysql',
+    graph_total => 'Total',
+    graph_printf => '%5.1lf',
+    graph_info => 'This shows a snapshot of connections, there may be many more connections in use between these checks. Please refer to the "Connections" graph labeled "Max used"'
+   },
+   'byClient' =>
+   {
+    _multigraph => 'mysql_connections_byclient',
+    graph_title => 'Connections by client hostname',
+    graph_vlabel => 'Connections',
+    graph_category => 'mysql',
+    graph_total => 'Total',
+    graph_printf => '%5.1lf',
+    graph_info => 'This shows a snapshot of connections, there may be many more connections in use between these checks. Please refer to the "Connections" graph labeled "Max used"'
+   }
+  );
+
+
+sub db_connect {
+  my $dsn = "$config{dsn};mysql_connect_timeout=5";
+
+  return DBI->connect($dsn, $config{user}, $config{password},
+		      { RaiseError       => 1,
+			PrintError       => 0,
+			FetchHashKeyName => 'NAME_lc',
+		      });
+}
+
+
+sub collect {
+  my $dbh = db_connect();
+  my $sth = $dbh->prepare("show full processlist");
+  $sth->execute();
+  my $r = {};
+  while (my $row = $sth->fetchrow_hashref) {
+    my $host = $row->{'host'};
+
+    # Assuming that the first part of the FQDN is enough for
+    # identification.  Port number is certainly not welcome.
+    if ($host =~ m/^(\d+\.\d+\.\d+)/ ) {
+      $host = "IP: $1.*";
+    } else {
+      ($host, undef) = split(/[\.:]/,$host,2);
+    }
+
+    $row->{'db'} ||= 'none';
+
+    $r->{'byClient'}->{$host} ++;
+    $r->{'byUser'}->{$row->{'user'}} ++;
+    $r->{'byDb'}->{$row->{'db'}} ++;
+  }
+  $sth->finish();
+  $dbh->disconnect();
+
+  return $r;
+}
+
+
+sub persist {
+    my ($result) = @_;
+
+    my @oldstate = restore_state();
+    if (@oldstate) {
+      @oldstate = @{ thaw(@oldstate) };
+    } else {
+      @oldstate = (['no version','no file'],[],[],[]);
+    }
+
+    my $v = [];
+    my $o = {};
+
+    # Look for a version stamp
+    ($v, undef) = @oldstate;
+    $v->[0] //= '';
+    $v->[1] //= 0;
+
+    # Did we find a recognizable version?
+    if ($v->[0] eq 'VERSION' && $v->[1] eq '1') {
+      ($v, $o->{byUser}, $o->{byDb}, $o->{byClient}) = @oldstate;
+    } else {
+      # Unknown version, zero it
+      warn "Unknown plugin state file version '",$v->[0],' ',$v->[1],"'\n";;
+      ($o->{byUser}, $o->{byDb}, $o->{byClient}) = ([],[],[]);
+    }
+
+    for my $k (keys $o) {
+	map { $result->{$k}->{$_} //= 0 }  @{$o->{$k}}
+    }
+
+    my @state = (['VERSION','1'],
+		 [keys $result->{byUser}],
+		 [keys $result->{byDb}],
+		 [keys $result->{byClient}]);
+
+    my $frozen = freeze(\@state);
+
+    save_state($frozen);
+}
+
+
+sub config {
+  my ($r) = @_;
+
+  for my $by (keys %$r) {
+    say "multigraph ", $munin_config{$by}->{_multigraph};
+
+    map { say "$_ ",$munin_config{$by}->{$_}; } keys %{$munin_config{$by}};
+
+    for my $ts (sort keys %{$r->{$by}}) {
+      my $label = clean_fieldname("l${ts}");
+      say "$label.label ", $ts;
+
+      map { say "$label.$_ ", $defaults{$_}; } keys %defaults;
+    }
+  }
+}
+
+
+sub show {
+  my ($r) = @_;
+
+  for my $by (keys %$r) {
+    say "multigraph ", $munin_config{$by}->{_multigraph};
+    for my $ts (sort keys %{$r->{$by}}) {
+      my $label = clean_fieldname("l${ts}");
+      say "$label.value ", $r->{$by}->{$ts};
+    }
+  }
+}
+
+
+sub main {
+  my $command = $ARGV[0] || 'show';
+
+  my $command_map = {
+		     'config'   => \&config,
+		     'show'     => \&show,
+		    };
+
+  die "Unknown command: $command" 
+    unless exists $command_map->{$command};
+
+  my $r = collect();
+
+  persist($r);
+
+  $command_map->{$command}($r);
+
+  0;
+}
+
+
+exit main() unless caller;
+
+1;
